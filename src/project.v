@@ -1,27 +1,177 @@
-/*
- * Copyright (c) 2024 Your Name
- * SPDX-License-Identifier: Apache-2.0
- */
-
 `default_nettype none
 
-module tt_um_example (
-    input  wire [7:0] ui_in,    // Dedicated inputs
-    output wire [7:0] uo_out,   // Dedicated outputs
-    input  wire [7:0] uio_in,   // IOs: Input path
-    output wire [7:0] uio_out,  // IOs: Output path
-    output wire [7:0] uio_oe,   // IOs: Enable path (active high: 0=input, 1=output)
-    input  wire       ena,      // always 1 when the design is powered, so you can ignore it
-    input  wire       clk,      // clock
-    input  wire       rst_n     // reset_n - low to reset
+module tt_um_project_fpu #(
+    parameter EXP_W = 5,            // exponent width  (default: FP16)
+    parameter MAN_W = 10            // mantissa width   (default: FP16)
+)(
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire [7:0] ui_in,
+    input  wire [7:0] uio_in,
+    output wire [7:0] uio_out,
+    output wire [7:0] uio_oe,
+    input  wire       ena,
+    output wire [7:0] uo_out
 );
 
-  // All output pins must be assigned. If not used, assign to 0.
-  assign uo_out  = ui_in + uio_in;  // Example: ou_out is the sum of ui_in and uio_in
-  assign uio_out = 0;
-  assign uio_oe  = 0;
+// Derived constants
+localparam WIDTH        = 1 + EXP_W + MAN_W;               // total FP width
+localparam BYTES_PER_OP = WIDTH / 8;                        // bytes per operand
+localparam TOTAL_BYTES  = 2 * BYTES_PER_OP;                 // a + b
+localparam WR_PTR_W     = $clog2(TOTAL_BYTES)  > 0
+                        ? $clog2(TOTAL_BYTES)  : 1;         // write-pointer width
+localparam RD_PTR_W     = $clog2(BYTES_PER_OP) > 0
+                        ? $clog2(BYTES_PER_OP) : 1;         // read-pointer width
 
-  // List all unused inputs to prevent warnings
-  wire _unused = &{ena, clk, rst_n, 1'b0};
+
+// Edge detection - single-stage pipeline (TT mux, same clock domain)
+    reg [1:0] wr_s, rd_s, st_s;
+
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        wr_s <= 2'b0;  rd_s <= 2'b0;  st_s <= 2'b0;
+    end else begin
+        wr_s  <= {wr_s[0],  ui_in[0]};
+        rd_s  <= {rd_s[0],  ui_in[1]};
+        st_s  <= {st_s[0],  ui_in[2]};
+    end
+end
+
+wire wr_pulse    =  wr_s[0] & ~wr_s[1];
+// wire wr_level    =  |wr_s;
+wire start_pulse =  st_s[0] & ~st_s[1];
+wire rd_fall     = ~rd_s[0] &  rd_s[1];
+wire rd_level    =  rd_s[0];
+
+reg wr_level;
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        wr_level <= 'd0;
+    end
+    else wr_level <= wr_pulse;
+end
+// Operand registers - NO reset (saves mux cells)
+reg [WIDTH-1:0]       a_reg, b_reg, result_reg;
+reg [WR_PTR_W-1:0]   wr_ptr;
+reg [RD_PTR_W-1:0]   rd_ptr;
+reg                   op_reg;
+reg                   busy, done_l, err_l, ready, core_start;
+
+// FPU Core instantiation (parameterized, combinational approach)
+wire [WIDTH-1:0] core_result;
+wire             core_done, core_err;
+
+fpu_core #(
+    .EXP_W (EXP_W),
+    .MAN_W (MAN_W)
+) u_fpu (
+    .clk       (clk),
+    .rst_n     (rst_n),
+    .op_a      (a_reg),
+    .op_b      (b_reg),
+    .op        (op_reg),
+    .start     (core_start),
+    .result    (core_result),
+    .done      (core_done),
+    .err       (core_err)
+);
+
+// Byte-write logic - uses synthesisable variable part-select
+// Each iteration of the loop is unrolled at elaboration (constant index).
+localparam [WR_PTR_W-1:0] BYTES_OFFSET = BYTES_PER_OP[WR_PTR_W-1:0];
+localparam [WR_PTR_W-1:0] WR_PTR_LAST  = TOTAL_BYTES[WR_PTR_W-1:0] - 1'b1;
+
+integer wi;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            for (wi = 0; wi < BYTES_PER_OP; wi = wi + 1) begin
+                a_reg[wi*8 +: 8] <= 'd0;
+                b_reg[wi*8 +: 8] <= 'd0;
+            end
+        end
+        else if (!busy && wr_pulse && !(start_pulse && ready)) begin
+            for (wi = 0; wi < BYTES_PER_OP; wi = wi + 1) begin
+                if (wr_ptr == wi[WR_PTR_W-1:0])
+                    a_reg[wi*8 +: 8] <= uio_in;
+                if (wr_ptr == (BYTES_OFFSET + wi[WR_PTR_W-1:0]))
+                    b_reg[wi*8 +: 8] <= uio_in;
+            end
+        end
+end
+
+// Control FSM
+always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+        wr_ptr     <= {WR_PTR_W{1'b0}};
+        rd_ptr     <= {RD_PTR_W{1'b0}};
+        op_reg     <= 1'b0;
+        busy       <= 1'b0;
+        done_l     <= 1'b0;
+        err_l      <= 1'b0;
+        ready      <= 1'b0;
+        core_start <= 1'b0;
+        result_reg <= {WIDTH{1'b0}};
+    end else begin
+        core_start <= 1'b0;                          // default: 1-cycle pulse
+
+        if (busy) begin
+            // LOCKED - ignore user inputs while core computes
+            if (!core_start && (core_done || core_err)) begin
+                busy       <= 1'b0;
+                done_l     <= core_done;
+                err_l      <= core_err;
+                result_reg <= core_result;
+            end
+        end else begin
+            if (start_pulse && ready) begin
+                op_reg     <= ui_in[3];
+                core_start <= 1'b1;
+                busy       <= 1'b1;
+                done_l     <= 1'b0;
+                err_l      <= 1'b0;
+                rd_ptr     <= {RD_PTR_W{1'b0}};
+            end
+            else if (wr_pulse) begin
+                wr_ptr <= wr_ptr + {{(WR_PTR_W-1){1'b0}}, 1'b1};
+                ready  <= (wr_ptr == WR_PTR_LAST);  // ready after last byte
+            end
+            else if (rd_fall && !wr_level) begin
+                rd_ptr <= rd_ptr + {{(RD_PTR_W-1){1'b0}}, 1'b1};
+            end
+        end
+    end
+end
+
+// Byte-read mux (safe for all widths, including FP8 where only 1 byte)
+reg [7:0] rd_byte;
+integer ri;
+always @(*) begin
+    rd_byte = result_reg[7:0];                       // default: lowest byte
+    for (ri = 1; ri < BYTES_PER_OP; ri = ri + 1) begin
+        if (rd_ptr == ri[RD_PTR_W-1:0])
+            rd_byte = result_reg[ri*8 +: 8];
+    end
+end
+
+// Output assignments
+    assign uio_oe  = (!(wr_level || wr_pulse) && rd_level && !busy) ? 8'hFF : 8'h00;
+assign uio_out = rd_byte;
+
+assign uo_out[0] = busy;
+assign uo_out[1] = done_l;
+assign uo_out[2] = err_l;
+assign uo_out[3] = ready;
+
+// Show write-pointer on uo_out[7:4] (up to 4 bits)
+generate
+    if (WR_PTR_W >= 4) begin : gen_wrptr_wide
+        assign uo_out[7:4] = wr_ptr[3:0];
+    end else begin : gen_wrptr_narrow
+        assign uo_out[7:4] = {{(4-WR_PTR_W){1'b0}}, wr_ptr};
+    end
+endgenerate
+
+// Tie off unused inputs
+wire _unused = &{ena, ui_in[7:4], 1'b0};
 
 endmodule
